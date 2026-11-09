@@ -4,7 +4,7 @@ import pytest
 from typer.testing import CliRunner
 
 from fsaudit import scanner
-from fsaudit.analysis import diff_scans, find_duplicates
+from fsaudit.analysis import diff, duplicates
 from fsaudit.cli import app
 from fsaudit.db import FileRecord
 
@@ -58,18 +58,18 @@ def test_doublons_et_fichiers_vides() -> None:
         rec("d", "v", 0),
         rec("e", "v", 0),
     ]
-    groups = find_duplicates(files)
+    groups = duplicates(files)
     assert [{f.path for f in g} for g in groups] == [{"a", "b"}]
 
 
 def test_diff() -> None:
     old = [rec("a", "1"), rec("b", "2"), rec("c", "3"), rec("d", "4")]
     new = [rec("a", "1"), rec("b", "22"), rec("e", "3"), rec("f", "5")]
-    result = diff_scans(old, new)
-    assert result.added == ["f"]
-    assert result.removed == ["d"]
-    assert result.modified == ["b"]
-    assert result.moved == [("c", "e")]
+    added, removed, modified, moved = diff(old, new)
+    assert added == ["f"]
+    assert removed == ["d"]
+    assert modified == ["b"]
+    assert moved == [("c", "e")]
 
 
 def test_cli_de_bout_en_bout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -84,14 +84,13 @@ def test_cli_de_bout_en_bout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     result = runner.invoke(app, ["scan", str(data), "--exclude", "*.jpg"])
     assert result.exit_code == 0
     assert "2 fichiers" in result.output
-
     assert "2 copies" in runner.invoke(app, ["dupes"]).output
 
     (data / "n.txt").write_text("nouveau")
     (data / "sub" / "b.txt").unlink()
     runner.invoke(app, ["scan", str(data), "--exclude", "*.jpg"])
-    diff = runner.invoke(app, ["diff"]).output
-    assert "+ ajouté" in diff and "n.txt" in diff
-    assert "- supprimé" in diff and "b.txt" in diff
+    output = runner.invoke(app, ["diff"]).output
+    assert "+ ajouté" in output and "n.txt" in output
+    assert "- supprimé" in output and "b.txt" in output
 
     assert runner.invoke(app, ["scan", str(tmp_path / "absent")]).exit_code == 1

@@ -1,4 +1,4 @@
-"""Base SQLite : une table pour les scans, une table pour les fichiers."""
+"""Base SQLite : on enregistre chaque scan avec la liste de ses fichiers."""
 
 import sqlite3
 from dataclasses import dataclass
@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 @dataclass
 class FileRecord:
+    """Les informations d'un fichier, telles qu'enregistrées en base."""
+
     path: str
     size: int
     mtime: float
@@ -26,21 +28,20 @@ def connect(db_path: str) -> sqlite3.Connection:
 
 
 def save_scan(conn: sqlite3.Connection, root: str, files: list[FileRecord]) -> int:
-    """Enregistre un scan complet (tous les fichiers d'un coup). Renvoie son id."""
+    """Enregistre un scan avec tous ses fichiers. Renvoie l'id du scan."""
     cur = conn.execute("INSERT INTO scans (root) VALUES (?)", (root,))
     scan_id = int(cur.lastrowid or 0)
-    conn.executemany(
-        "INSERT INTO files VALUES (?, ?, ?, ?, ?, ?, ?)",
-        [
-            (scan_id, f.path, f.size, f.mtime, f.extension, f.mime, f.hash)
-            for f in files
-        ],
-    )
+    for f in files:
+        conn.execute(
+            "INSERT INTO files VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (scan_id, f.path, f.size, f.mtime, f.extension, f.mime, f.hash),
+        )
     conn.commit()
     return scan_id
 
 
-def get_files(conn: sqlite3.Connection, scan_id: int) -> list[FileRecord]:
+def load_files(conn: sqlite3.Connection, scan_id: int) -> list[FileRecord]:
+    """Relit tous les fichiers d'un scan."""
     rows = conn.execute(
         "SELECT path, size, mtime, extension, mime, hash FROM files WHERE scan_id = ?",
         (scan_id,),
@@ -48,16 +49,17 @@ def get_files(conn: sqlite3.Connection, scan_id: int) -> list[FileRecord]:
     return [FileRecord(*row) for row in rows]
 
 
-def latest_scan(conn: sqlite3.Connection) -> int | None:
+def last_scan(conn: sqlite3.Connection) -> int | None:
+    """Id du dernier scan, ou None si la base est vide."""
     row = conn.execute("SELECT MAX(id) FROM scans").fetchone()
-    return row[0] if row else None
+    return None if row[0] is None else int(row[0])
 
 
 def previous_scan(conn: sqlite3.Connection, scan_id: int) -> int | None:
-    """Le scan précédent du MÊME dossier, ou None."""
+    """Id du scan précédent, pour le même dossier. None s'il n'y en a pas."""
     row = conn.execute(
-        "SELECT id FROM scans WHERE root = (SELECT root FROM scans WHERE id = ?) "
-        "AND id < ? ORDER BY id DESC LIMIT 1",
+        "SELECT id FROM scans WHERE id < ? AND root = "
+        "(SELECT root FROM scans WHERE id = ?) ORDER BY id DESC LIMIT 1",
         (scan_id, scan_id),
     ).fetchone()
     return row[0] if row else None

@@ -11,7 +11,7 @@ logger = logging.getLogger("fsaudit")
 
 
 def file_hash(path: Path) -> str:
-    #Cette fonction permet de définir le hash d'un fichier, on le parcours que 1mo par 1mo pour ne pas saturer la mémoire
+    # Cette fonction permet de définir le hash d'un fichier, on le parcours que 1mo par 1mo pour ne pas saturer la mémoire
     sha = hashlib.sha256()
     with path.open("rb") as f:
         while True:
@@ -23,7 +23,7 @@ def file_hash(path: Path) -> str:
 
 
 def matches(name: str, patterns: list[str]) -> bool:
-    #On identifie l'extension du fichier puis on retourne un booléen quand c'est true on est sur la bonne
+    # On identifie l'extension du fichier puis on retourne un booléen quand c'est true on est sur la bonne
     for pattern in patterns:
         if fnmatch.fnmatch(name, pattern):
             return True
