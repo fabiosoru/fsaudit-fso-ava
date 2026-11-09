@@ -1,5 +1,3 @@
-"""Parcourt un dossier et renvoie la liste des fichiers trouvés."""
-
 import fnmatch
 import hashlib
 import logging
@@ -13,53 +11,82 @@ logger = logging.getLogger("fsaudit")
 
 
 def file_hash(path: Path) -> str:
-    """Empreinte SHA-256, lue par morceaux de 1 Mo pour ne pas saturer la mémoire."""
+    #Cette fonction permet de définir le hash d'un fichier, on le parcours que 1mo par 1mo pour ne pas saturer la mémoire
     sha = hashlib.sha256()
     with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            sha.update(chunk)
+        while True:
+            morceau = f.read(1024 * 1024)
+            if morceau == b"":
+                break
+            sha.update(morceau)
     return sha.hexdigest()
+
+
+def matches(name: str, patterns: list[str]) -> bool:
+    #On identifie l'extension du fichier puis on retourne un booléen quand c'est true on est sur la bonne
+    for pattern in patterns:
+        if fnmatch.fnmatch(name, pattern):
+            return True
+    return False
+
+
+def make_record(path: Path) -> FileRecord:
+    """Crée la fiche d'un fichier (peut lever OSError si le fichier est illisible)."""
+    stat = path.stat()
+    mime, _ = mimetypes.guess_type(path.name)
+    if mime is None:
+        mime = "application/octet-stream"  # type inconnu
+    return FileRecord(
+        path=str(path),
+        size=stat.st_size,
+        mtime=stat.st_mtime,
+        extension=path.suffix.lower(),
+        mime=mime,
+        hash=file_hash(path),
+    )
 
 
 def scan(
     root: Path, excludes: list[str], includes: list[str]
 ) -> tuple[list[FileRecord], int]:
-    """Renvoie (fichiers trouvés, nombre d'erreurs)."""
+    """Parcourt `root` et renvoie (liste des fiches, nombre d'erreurs)."""
     files: list[FileRecord] = []
     errors = 0
 
-    for dirpath, dirnames, filenames in os.walk(root, onerror=_log_folder_error):
-        dirnames[:] = [d for d in dirnames if not _matches(d, excludes)]
+    # os.walk visite le dossier, puis ses sous-dossiers, etc.
+    for dirpath, dirnames, filenames in os.walk(root, onerror=log_folder_error):
+        # On retire les sous-dossiers exclus : os.walk n'ira pas dedans
+        for dirname in list(dirnames):
+            if matches(dirname, excludes):
+                dirnames.remove(dirname)
+
         for name in filenames:
-            if _matches(name, excludes):
-                continue
-            if includes and not _matches(name, includes):
-                continue
+            if matches(name, excludes):
+                continue  # fichier exclu : on passe au suivant
+            if len(includes) > 0 and not matches(name, includes):
+                continue  # on veut seulement certains fichiers, pas celui-ci
+
             path = Path(dirpath) / name
             try:
-                stat = path.stat()
-                files.append(
-                    FileRecord(
-                        path=str(path),
-                        size=stat.st_size,
-                        mtime=stat.st_mtime,
-                        extension=path.suffix.lower(),
-                        mime=mimetypes.guess_type(name)[0]
-                        or "application/octet-stream",
-                        hash=file_hash(path),
-                    )
-                )
-            except OSError as err:  # permission refusée, fichier disparu...
+                files.append(make_record(path))
+            except PermissionError:
                 errors += 1
-                logger.error("Fichier ignoré %s : %s", path, err)
+                logger.error("Permission refusée, fichier ignoré : %s", path)
+            except FileNotFoundError:
+                errors += 1
+                logger.error("Fichier disparu pendant le scan : %s", path)
+            except OSError as err:  # autre problème de lecture (disque, réseau...)
+                errors += 1
+                logger.error("Erreur de lecture, fichier ignoré %s : %s", path, err)
 
     return files, errors
 
 
-def _matches(name: str, patterns: list[str]) -> bool:
-    """Vrai si le nom correspond à un des motifs, par exemple '*.jpg'."""
-    return any(fnmatch.fnmatch(name, pattern) for pattern in patterns)
-
-
-def _log_folder_error(err: OSError) -> None:
-    logger.error("Dossier illisible : %s", err)
+def log_folder_error(err: OSError) -> None:
+    # Appelée par os.walk quand un dossier est illisible.
+    if isinstance(err, PermissionError):
+        logger.error("Permission refusée, dossier ignoré : %s", err.filename)
+    elif isinstance(err, FileNotFoundError):
+        logger.error("Dossier disparu pendant le scan : %s", err.filename)
+    else:
+        logger.error("Dossier illisible : %s", err)
