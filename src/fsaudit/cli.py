@@ -1,43 +1,38 @@
 """Interface en ligne de commande : fsaudit scan | dupes | diff | top."""
 
-import json
+import logging
 import sqlite3
-from dataclasses import asdict
 from pathlib import Path
 from typing import Annotated
 
 import typer
 
-from fsaudit import analysis, db
-from fsaudit.config import load_config
-from fsaudit.log import setup_logging
+from fsaudit import analysis, config, db
 from fsaudit.scanner import scan
 
 app = typer.Typer(help="Outil d'audit de fichiers.")
 
-JsonOption = Annotated[bool, typer.Option("--json", help="Sortie au format JSON")]
-
 
 @app.callback()
 def main() -> None:
-    config = load_config()
-    setup_logging(config.log_file, config.log_level)
+    """Avant chaque commande : logs dans la console et dans fsaudit.log."""
+    logging.basicConfig(
+        level=config.LOG_LEVEL,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(config.LOG_FILE, encoding="utf-8"),
+        ],
+    )
 
 
-def _open_db() -> sqlite3.Connection:
-    return db.connect(load_config().db_path)
-
-
-def _latest_scan(conn: sqlite3.Connection) -> int:
+def _latest(conn: sqlite3.Connection) -> int:
+    """Id du dernier scan. Sort avec un message si la base est vide."""
     scan_id = db.latest_scan(conn)
     if scan_id is None:
         typer.echo("Aucun scan en base. Lancez d'abord : fsaudit scan <dossier>")
         raise typer.Exit(code=1)
     return scan_id
-
-
-def _print_json(data: object) -> None:
-    typer.echo(json.dumps(data, indent=2, ensure_ascii=False))
 
 
 @app.command("scan")
@@ -46,69 +41,42 @@ def scan_cmd(
     exclude: Annotated[list[str] | None, typer.Option(help="Pattern à exclure")] = None,
     include: Annotated[list[str] | None, typer.Option(help="Pattern à inclure")] = None,
 ) -> None:
-    """Scanne un dossier et l'indexe en base."""
+    """Scanne un dossier et l'enregistre en base."""
     if not root.is_dir():
         typer.echo(f"{root} n'est pas un dossier.")
         raise typer.Exit(code=1)
-    root = root.resolve()  # chemins absolus : le diff marche depuis n'importe où
-    config = load_config()
-    conn = db.connect(config.db_path)
-    # fsaudit ne doit pas s'indexer lui-même (base, journal SQLite et log)
-    own_files = {
-        Path(config.db_path),
-        Path(config.db_path + "-journal"),
-        Path(config.log_file),
-    }
-    scan_id, indexed, errors = scan(conn, root, exclude, include, own_files)
-    typer.echo(f"Scan {scan_id} : {indexed} fichiers indexés, {errors} erreurs.")
+
+    folder = root.resolve()
+    files, errors = scan(folder, exclude or [], include or [])
+    scan_id = db.save_scan(db.connect(config.DB_PATH), str(folder), files)
+    typer.echo(f"Scan {scan_id} : {len(files)} fichiers, {errors} erreurs.")
 
 
 @app.command()
-def dupes(as_json: JsonOption = False) -> None:
-    """Liste les doublons et l'espace récupérable."""
-    conn = _open_db()
-    files = db.get_files(conn, _latest_scan(conn))
-    groups = analysis.find_duplicates(files)
-    total = sum(analysis.wasted_space(g) for g in groups)
-
-    if as_json:
-        _print_json(
-            {
-                "total_recoverable_bytes": total,
-                "groups": [
-                    {
-                        "wasted_bytes": analysis.wasted_space(g),
-                        "files": [f.path for f in g],
-                    }
-                    for g in groups
-                ],
-            }
-        )
-        return
+def dupes() -> None:
+    """Doublons et espace récupérable (dernier scan)."""
+    conn = db.connect(config.DB_PATH)
+    groups = analysis.find_duplicates(db.get_files(conn, _latest(conn)))
 
     for group in groups:
-        wasted = analysis.wasted_space(group)
-        typer.echo(f"\n{len(group)} copies, {wasted} octets récupérables :")
+        typer.echo(f"\n{len(group)} copies, {analysis.wasted_space(group)} octets :")
         for f in group:
             typer.echo(f"  {f.path}")
+    total = sum(analysis.wasted_space(g) for g in groups)
     typer.echo(f"\nTotal récupérable : {total} octets")
 
 
 @app.command("diff")
-def diff_cmd(as_json: JsonOption = False) -> None:
+def diff_cmd() -> None:
     """Compare les deux derniers scans d'un même dossier."""
-    conn = _open_db()
-    pair = db.two_latest_scans_same_root(conn)
-    if pair is None:
+    conn = db.connect(config.DB_PATH)
+    new_id = _latest(conn)
+    old_id = db.previous_scan(conn, new_id)
+    if old_id is None:
         typer.echo("Il faut deux scans du même dossier pour faire un diff.")
         raise typer.Exit(code=1)
-    old, new = db.get_files(conn, pair[0]), db.get_files(conn, pair[1])
-    result = analysis.diff_scans(old, new)
 
-    if as_json:
-        _print_json(asdict(result))
-        return
-
+    result = analysis.diff_scans(db.get_files(conn, old_id), db.get_files(conn, new_id))
     for path in result.added:
         typer.echo(f"+ ajouté    {path}")
     for path in result.removed:
@@ -120,28 +88,14 @@ def diff_cmd(as_json: JsonOption = False) -> None:
 
 
 @app.command()
-def top(
-    count: Annotated[int, typer.Option(help="Nombre de fichiers")] = 10,
-    as_json: JsonOption = False,
-) -> None:
-    """Fichiers les plus volumineux et répartition par extension."""
-    conn = _open_db()
-    files = db.get_files(conn, _latest_scan(conn))
-    largest = analysis.top_largest(files, count)
-    by_ext = analysis.size_by_extension(files)
-
-    if as_json:
-        _print_json(
-            {
-                "largest": [{"path": f.path, "size": f.size} for f in largest],
-                "size_by_extension": by_ext,
-            }
-        )
-        return
+def top(count: Annotated[int, typer.Option(help="Nombre de fichiers")] = 10) -> None:
+    """Plus gros fichiers et taille par extension (dernier scan)."""
+    conn = db.connect(config.DB_PATH)
+    files = db.get_files(conn, _latest(conn))
 
     typer.echo(f"Top {count} des fichiers :")
-    for f in largest:
+    for f in analysis.top_largest(files, count):
         typer.echo(f"  {f.size:>12}  {f.path}")
     typer.echo("\nTaille par extension :")
-    for ext, size in by_ext.items():
+    for ext, size in analysis.size_by_extension(files).items():
         typer.echo(f"  {ext:<10} {size:>12}")

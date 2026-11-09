@@ -1,4 +1,4 @@
-"""Analyses : doublons, diff entre scans, top des fichiers."""
+"""Analyses : doublons, différences entre deux scans, plus gros fichiers."""
 
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -7,18 +7,18 @@ from fsaudit.db import FileRecord
 
 
 def find_duplicates(files: list[FileRecord]) -> list[list[FileRecord]]:
-    """Groupes de fichiers au contenu identique (même hash), le plus lourd d'abord."""
+    """Groupes de fichiers au contenu identique (même hash), les plus gaspilleurs d'abord."""
     by_hash: dict[str, list[FileRecord]] = defaultdict(list)
     for f in files:
-        if f.size > 0:  # fichiers vides : même hash, pas de vrais doublons
+        # Les fichiers vides ont tous le même hash : on ne les compte pas
+        if f.size > 0:
             by_hash[f.hash].append(f)
     groups = [g for g in by_hash.values() if len(g) > 1]
-    groups.sort(key=wasted_space, reverse=True)
-    return groups
+    return sorted(groups, key=wasted_space, reverse=True)
 
 
 def wasted_space(group: list[FileRecord]) -> int:
-    """Espace récupérable : on garde un exemplaire, on supprime les autres."""
+    """Octets récupérables : on garde une copie, on supprime les autres."""
     return group[0].size * (len(group) - 1)
 
 
@@ -31,39 +31,43 @@ class DiffResult:
 
 
 def diff_scans(old: list[FileRecord], new: list[FileRecord]) -> DiffResult:
+    """Compare deux scans du même dossier."""
     old_by_path = {f.path: f for f in old}
     new_by_path = {f.path: f for f in new}
     result = DiffResult()
 
-    added = [f for p, f in new_by_path.items() if p not in old_by_path]
-    removed = [f for p, f in old_by_path.items() if p not in new_by_path]
-
-    for path, new_file in new_by_path.items():
-        old_file = old_by_path.get(path)
-        if old_file is not None and old_file.hash != new_file.hash:
+    # Même chemin dans les deux scans : modifié si le contenu a changé
+    for path, f in new_by_path.items():
+        if path in old_by_path and old_by_path[path].hash != f.hash:
             result.modified.append(path)
 
-    # Déplacé = supprimé à un endroit et ajouté ailleurs avec le même contenu
-    removed_by_hash: dict[str, list[FileRecord]] = defaultdict(list)
-    for f in removed:
-        if f.size == 0:  # un fichier vide ne peut pas être déplacé de façon fiable
-            result.removed.append(f.path)
+    # Chemins qui ont disparu, rangés par hash pour repérer les déplacements
+    gone_by_hash: dict[str, list[str]] = defaultdict(list)
+    for path, f in old_by_path.items():
+        if path not in new_by_path:
+            if f.size > 0:
+                gone_by_hash[f.hash].append(path)
+            else:
+                result.removed.append(path)
+
+    # Chemins apparus : déplacés si un chemin disparu a le même contenu, sinon ajoutés
+    for path, f in new_by_path.items():
+        if path in old_by_path:
             continue
-        removed_by_hash[f.hash].append(f)
-
-    for f in added:
-        candidates = removed_by_hash.get(f.hash) if f.size > 0 else None
-        if candidates:
-            origin = candidates.pop()
-            result.moved.append((origin.path, f.path))
+        sources = gone_by_hash.get(f.hash) if f.size > 0 else None
+        if sources:
+            result.moved.append((sources.pop(), path))
         else:
-            result.added.append(f.path)
+            result.added.append(path)
 
-    result.removed += [f.path for fl in removed_by_hash.values() for f in fl]
+    # Ce qui n'a pas de destination est supprimé
+    for paths in gone_by_hash.values():
+        result.removed.extend(paths)
     return result
 
 
 def top_largest(files: list[FileRecord], count: int) -> list[FileRecord]:
+    """Les `count` fichiers les plus lourds."""
     return sorted(files, key=lambda f: f.size, reverse=True)[:count]
 
 
